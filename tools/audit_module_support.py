@@ -34,6 +34,11 @@ MAINSRC and classifies each candidate into one of the following groups:
     The directory looks like an executable application, but the Makefile does
     not expose MODULE = $(CONFIG_...).
 
+  MANUAL_REVIEW
+    The directory has MAINSRC, but should not be converted mechanically because
+    its executable path is bootloader-specific or tied to a non-Dynamic-ELF
+    runtime mechanism.
+
   NO_CONFIG_SYMBOL
     A config symbol could not be resolved for the directory, so it needs a
     manual review.
@@ -62,6 +67,17 @@ EXCLUDED_BOOL_MODULE_SYMBOLS = {
     "SYSTEM_NXPKG",
 }
 
+MANUAL_REVIEW_MAKEFILES = {
+    "boot/mcuboot/Makefile":
+        "bootloader application; module conversion needs boot-flow review",
+    "boot/miniboot/Makefile":
+        "bootloader application; module conversion needs boot-flow review",
+    "boot/nxboot/Makefile":
+        "bootloader application; module conversion needs boot-flow review",
+    "netutils/thttpd/Makefile":
+        "CGI binfs/NXFLAT path; not a normal Dynamic ELF app conversion",
+}
+
 
 @dataclass
 class ConfigDef:
@@ -80,6 +96,7 @@ class AuditRow:
     module_symbol: str
     kconfig: str
     line: str
+    note: str = ""
 
 
 def build_config_index(apps_dir: Path) -> Dict[str, ConfigDef]:
@@ -130,7 +147,8 @@ def first_symbol_from_local_kconfig(makefile: Path) -> str:
     return ""
 
 
-def classify_makefile(makefile: Path, config_index: Dict[str, ConfigDef]) -> Optional[AuditRow]:
+def classify_makefile(apps_dir: Path, makefile: Path,
+                      config_index: Dict[str, ConfigDef]) -> Optional[AuditRow]:
     try:
         text = makefile.read_text(encoding="utf-8", errors="ignore")
     except OSError:
@@ -169,6 +187,9 @@ def classify_makefile(makefile: Path, config_index: Dict[str, ConfigDef]) -> Opt
             "",
         )
 
+    note = ""
+    review_key = makefile.relative_to(apps_dir).as_posix()
+
     if module_symbol:
         if config_def.cfg_type == "tristate":
             status = "READY"
@@ -179,6 +200,9 @@ def classify_makefile(makefile: Path, config_index: Dict[str, ConfigDef]) -> Opt
                 status = "BOOL_NEEDS_TRISTATE"
         else:
             status = "NO_CONFIG_SYMBOL"
+    elif review_key in MANUAL_REVIEW_MAKEFILES:
+        status = "MANUAL_REVIEW"
+        note = MANUAL_REVIEW_MAKEFILES[review_key]
     else:
         status = "MAKEFILE_NEEDS_MODULE"
 
@@ -190,6 +214,7 @@ def classify_makefile(makefile: Path, config_index: Dict[str, ConfigDef]) -> Opt
         module_symbol,
         str(config_def.path),
         str(config_def.line),
+        note,
     )
 
 
@@ -197,7 +222,7 @@ def iter_rows(apps_dir: Path) -> Iterable[AuditRow]:
     config_index = build_config_index(apps_dir)
 
     for makefile in sorted(apps_dir.rglob("Makefile")):
-        row = classify_makefile(makefile, config_index)
+        row = classify_makefile(apps_dir, makefile, config_index)
         if row is not None:
             yield row
 
@@ -229,7 +254,7 @@ def main() -> int:
     for row in rows:
         print(
             f"{row.status}|{row.makefile}|{row.symbol}|{row.cfg_type}|"
-            f"{row.module_symbol}|{row.kconfig}|{row.line}"
+            f"{row.module_symbol}|{row.kconfig}|{row.line}|{row.note}"
         )
 
     summary: Dict[str, int] = {}
