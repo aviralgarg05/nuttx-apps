@@ -30,6 +30,7 @@
 
 #include <sys/mount.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -136,6 +137,7 @@ const char *dirlist[] =
 {
   "errno",
   "hello",
+  "multi",
 #ifndef CONFIG_DISABLE_SIGNALS
   "signal",
 #endif
@@ -217,6 +219,54 @@ static void mm_initmonitor(void)
 static inline void testheader(FAR const char *progname)
 {
   message("\n%s\n* Executing %s\n%s\n\n", delimiter, progname, delimiter);
+}
+
+/****************************************************************************
+ * Name: run_multi_instance
+ ****************************************************************************/
+
+static int run_multi_instance(FAR const char *filename)
+{
+  FAR char *args1[] = {"multi", "1", NULL};
+  FAR char *args2[] = {"multi", "2", NULL};
+  pid_t pid1;
+  pid_t pid2;
+  int status1;
+  int status2;
+
+  pid1 = exec(filename, args1, NULL, g_elf_exports, g_elf_nexports);
+  if (pid1 < 0)
+    {
+      errmsg("ERROR: first exec(%s) failed: %s\n",
+             filename, strerror(errno));
+      return ERROR;
+    }
+
+  pid2 = exec(filename, args2, NULL, g_elf_exports, g_elf_nexports);
+  if (pid2 < 0)
+    {
+      errmsg("ERROR: second exec(%s) failed: %s\n",
+             filename, strerror(errno));
+      waitpid(pid1, &status1, 0);
+      return ERROR;
+    }
+
+  if (waitpid(pid1, &status1, 0) != pid1 ||
+      waitpid(pid2, &status2, 0) != pid2)
+    {
+      errmsg("ERROR: waitpid() failed: %s\n", strerror(errno));
+      return ERROR;
+    }
+
+  if (!WIFEXITED(status1) || WEXITSTATUS(status1) != EXIT_SUCCESS ||
+      !WIFEXITED(status2) || WEXITSTATUS(status2) != EXIT_SUCCESS)
+    {
+      errmsg("ERROR: multi-instance status: %#x, %#x\n", status1, status2);
+      return ERROR;
+    }
+
+  message("MULTI PASS: two concurrent instances kept independent state\n");
+  return OK;
 }
 
 /****************************************************************************
@@ -389,9 +439,16 @@ int main(int argc, FAR char *argv[])
        * table information is available within the OS.
        */
 
-      args[0] = (FAR char *)dirlist[i];
-      args[1] = NULL;
-      ret = exec(filename, args, NULL, g_elf_exports, g_elf_nexports);
+      if (strcmp(dirlist[i], "multi") == 0)
+        {
+          ret = run_multi_instance(filename);
+        }
+      else
+        {
+          args[0] = (FAR char *)dirlist[i];
+          args[1] = NULL;
+          ret = exec(filename, args, NULL, g_elf_exports, g_elf_nexports);
+        }
 
       mm_update(&g_mmstep, "after exec");
 
@@ -400,7 +457,7 @@ int main(int argc, FAR char *argv[])
           errmsg("ERROR: exec(%s) failed: %s\n",
                  dirlist[i], strerror(errno));
         }
-      else
+      else if (strcmp(dirlist[i], "multi") != 0)
         {
           message("Wait a bit for test completion\n");
           sleep(4);

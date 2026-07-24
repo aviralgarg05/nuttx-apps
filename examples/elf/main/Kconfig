@@ -15,13 +15,13 @@ if EXAMPLES_ELF
 
 choice
 	prompt "ELF File System"
-	default EXAMPLES_ELF_ROMFS  if   FS_ROMFS && BUILD_FLAT
+	default EXAMPLES_ELF_ROMFS  if   FS_ROMFS
 	default EXAMPLES_ELF_CROMFS if  !FS_ROMFS && FS_CROMFS && BUILD_FLAT
-	default EXAMPLES_ELF_EXTERN if (!FS_ROMFS && !FS_CROMFS) || !BUILD_FLAT
+	default EXAMPLES_ELF_EXTERN if  !FS_ROMFS && (!FS_CROMFS || !BUILD_FLAT)
 
 config EXAMPLES_ELF_ROMFS
 	bool "ROMFS"
-	depends on FS_ROMFS && BUILD_FLAT
+	depends on FS_ROMFS
 	---help---
 		Automatically generates and mounts an internal ROMFS file
 		system

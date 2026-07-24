@@ -30,7 +30,7 @@ MAINSRC = elf_main.c
 SYMTABSRC = test_symtab.c
 SYMTABOBJ = $(SYMTABSRC:.c=$(OBJEXT))
 
-ELFNAME_BASE = errno hello
+ELFNAME_BASE = errno hello multi
 ifneq ($(CONFIG_DISABLE_SIGNALS),y)
   ELFNAME_BASE += signal
 endif

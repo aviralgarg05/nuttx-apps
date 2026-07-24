@@ -1,5 +1,7 @@
 ############################################################################
-# apps/examples/elf/tests/Make.defs
+# apps/examples/elf/tests/multi/Makefile
+#
+# SPDX-License-Identifier: Apache-2.0
 #
 # Licensed to the Apache Software Foundation (ASF) under one or more
 # contributor license agreements.  See the NOTICE file distributed with
@@ -18,25 +20,12 @@
 #
 ############################################################################
 
-ifeq ($(CONFIG_EXAMPLES_ELF),y)
-  CONFIGURED_APPS += $(APPDIR)/examples/elf/tests/errno
-  CONFIGURED_APPS += $(APPDIR)/examples/elf/tests/hello
-  CONFIGURED_APPS += $(APPDIR)/examples/elf/tests/multi
-  ifneq ($(CONFIG_DISABLE_SIGNALS),y)
-    CONFIGURED_APPS += $(APPDIR)/examples/elf/tests/signal
-  endif
-  CONFIGURED_APPS += $(APPDIR)/examples/elf/tests/struct
-  ifeq ($(CONFIG_HAVE_CXX),y)
-    CONFIGURED_APPS += $(APPDIR)/examples/elf/tests/helloxx
-  endif
-  ifeq ($(CONFIG_EXAMPLES_ELF_LONGJMP),y)
-    CONFIGURED_APPS += $(APPDIR)/examples/elf/tests/longjmp
-  endif
-  ifneq ($(CONFIG_DISABLE_PTHREAD),y)
-    CONFIGURED_APPS += $(APPDIR)/examples/elf/tests/mutex
-    CONFIGURED_APPS += $(APPDIR)/examples/elf/tests/pthread
-  endif
-  ifneq ($(CONFIG_ARCH_ADDRENV),y)
-    CONFIGURED_APPS += $(APPDIR)/examples/elf/tests/task
-  endif
-endif
+include $(APPDIR)/Make.defs
+
+PROGNAME  = multi
+PRIORITY  = 100
+STACKSIZE = $(CONFIG_ELF_STACKSIZE)
+MODULE    = m
+MAINSRC   = multi.c
+
+include $(APPDIR)/Application.mk
