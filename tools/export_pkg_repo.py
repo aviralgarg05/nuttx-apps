@@ -17,7 +17,7 @@
 # License for the specific language governing permissions and limitations
 # under the License.
 
-"""Build an nxpkg repository from compiled artifacts."""
+"""Build an nxpkg repository from artifacts and Package.mk files."""
 
 from __future__ import annotations
 
@@ -26,9 +26,9 @@ import hashlib
 import json
 import shutil
 import struct
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional, Tuple
 
 VALID_TYPES = {"elf", "shared-lib"}
 PACKAGE_SPEC_HELP = (
@@ -42,6 +42,13 @@ ICON_SIZE = 48
 LV_IMAGE_HEADER_MAGIC = 0x19
 LV_COLOR_FORMAT_RGB565 = 0x12
 
+DECLARATION_NAME = "Package.mk"
+
+MODULE_TYPES = {
+    "executable": "elf",
+    "shared_library": "shared-lib",
+}
+
 
 @dataclass
 class PackageSpec:
@@ -49,6 +56,10 @@ class PackageSpec:
     version: str
     payload_type: str
     source: Path
+    requires: List[str] = field(default_factory=list)
+    description: Optional[str] = None
+    category: Optional[str] = None
+    icon: Optional[Path] = None
 
 
 def sha256_file(path: Path) -> str:
@@ -64,11 +75,18 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def parse_component(value: str) -> str:
+def validate_component(value: str, label: str = "value") -> str:
     if not value or value in {".", ".."} or "/" in value or "\\" in value:
-        raise argparse.ArgumentTypeError("value must be one path component")
+        raise ValueError(f"{label} must be one path component")
 
     return value
+
+
+def parse_component(value: str) -> str:
+    try:
+        return validate_component(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(str(error)) from error
 
 
 def parse_package_spec(value: str) -> PackageSpec:
@@ -103,7 +121,7 @@ def parse_name_value(value: str) -> tuple:
     if len(parts) != 2 or not parts[0] or not parts[1]:
         raise argparse.ArgumentTypeError("value must look like <name>=<text>")
 
-    return parts[0], parts[1]
+    return parse_component(parts[0]), parts[1]
 
 
 def parse_icon_spec(value: str) -> tuple:
@@ -115,6 +133,152 @@ def parse_icon_spec(value: str) -> tuple:
         raise argparse.ArgumentTypeError(msg)
 
     return name, source_path
+
+
+def parse_assignments(path: Path) -> Dict[str, str]:
+    """Read the `NAME := value` assignments out of a declaration file."""
+
+    values: Dict[str, str] = {}
+
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if not line:
+            continue
+
+        for separator in (":=", "="):
+            key, found, value = line.partition(separator)
+            if found:
+                values[key.strip()] = value.strip()
+                break
+
+    return values
+
+
+def declaration_icon(path: Path, value: str) -> Path:
+    root = path.parent.resolve()
+    icon = (root / value).resolve()
+    try:
+        icon.relative_to(root)
+    except ValueError as error:
+        message = f"{path}: LOCAL_ICON must stay below {root}"
+        raise ValueError(message) from error
+
+    if not icon.is_file():
+        raise ValueError(f"{path}: icon does not exist: {icon}")
+
+    return icon
+
+
+def declaration_to_spec(path: Path, bindir: Path) -> Optional[PackageSpec]:
+    """Read one built package declaration."""
+
+    values = parse_assignments(path)
+
+    name = values.get("LOCAL_MODULE")
+    if not name:
+        raise ValueError(f"{path}: LOCAL_MODULE is required")
+    validate_component(name, f"{path}: LOCAL_MODULE")
+
+    version = values.get("LOCAL_VERSION")
+    if not version:
+        raise ValueError(f"{path}: LOCAL_VERSION is required")
+    validate_component(version, f"{path}: LOCAL_VERSION")
+
+    module_type = values.get("LOCAL_MODULE_TYPE", "executable")
+    payload_type = MODULE_TYPES.get(module_type)
+    if payload_type is None:
+        expected = ", ".join(sorted(MODULE_TYPES))
+        raise ValueError(
+            f"{path}: unsupported LOCAL_MODULE_TYPE '{module_type}', "
+            f"expected one of {expected}"
+        )
+
+    filename = values.get("LOCAL_MODULE_FILENAME", name)
+    validate_component(filename, f"{path}: LOCAL_MODULE_FILENAME")
+    source = bindir / filename
+    if not source.is_file():
+        return None
+
+    requires = values.get("LOCAL_SHARED_LIBS", "").split()
+    for dependency in requires:
+        validate_component(dependency, f"{path}: LOCAL_SHARED_LIBS")
+
+    icon = None
+    if values.get("LOCAL_ICON"):
+        icon = declaration_icon(path, values["LOCAL_ICON"])
+
+    return PackageSpec(
+        name=name,
+        version=version,
+        payload_type=payload_type,
+        source=source.resolve(),
+        requires=requires,
+        description=values.get("LOCAL_DESCRIPTION") or None,
+        category=values.get("LOCAL_CATEGORY") or None,
+        icon=icon,
+    )
+
+
+def discover_declarations(
+    roots: List[Path], bindir: Path
+) -> List[PackageSpec]:  # fmt: skip
+    """Collect a specification for every declaration file below the roots."""
+
+    specs: List[PackageSpec] = []
+
+    for root in roots:
+        if not root.is_dir():
+            raise ValueError(f"scan path is not a directory: {root}")
+
+        for path in sorted(root.rglob(DECLARATION_NAME)):
+            spec = declaration_to_spec(path, bindir)
+            if spec is not None:
+                specs.append(spec)
+
+    return specs
+
+
+def read_config(path: Path) -> Dict[str, str]:
+    """Read the CONFIG_* settings out of a generated NuttX .config."""
+
+    config: Dict[str, str] = {}
+
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line.startswith("CONFIG_") or "=" not in line:
+            continue
+
+        key, _, value = line.partition("=")
+        config[key.strip()] = value.strip().strip('"')
+
+    return config
+
+
+def derive_target(config: Dict[str, str]) -> Tuple[str, str, str]:
+    """Work out the target identity a package must match at install time.
+
+    These have to agree with pkg_runtime_arch() and pkg_runtime_compat() in
+    system/nxpkg, which the target checks a manifest against before it will
+    activate a package.
+    """
+
+    arch = config.get("CONFIG_ARCH", "")
+    chip = config.get("CONFIG_ARCH_CHIP", "")
+    compat = config.get("CONFIG_ARCH_BOARD", "")
+    if not compat:
+        compat = config.get("CONFIG_ARCH_BOARD_CUSTOM_NAME", "")
+
+    try:
+        validate_component(arch, "CONFIG_ARCH")
+        validate_component(chip, "CONFIG_ARCH_CHIP")
+        validate_component(compat, "CONFIG_ARCH_BOARD")
+    except ValueError as error:
+        raise ValueError(
+            "could not determine the target from the configuration; "
+            "pass --arch/--chip/--compat explicitly"
+        ) from error
+
+    return arch, chip, compat
 
 
 def artifact_relpath(arch: str, chip: str, compat: str,
@@ -211,21 +375,40 @@ def main() -> int:
     )
     parser.add_argument(
         "--arch",
-        required=True,
         type=parse_component,
-        help="Target architecture string, for example xtensa",
+        help="Target architecture, for example xtensa. Read from the "
+        "configuration when not given",
     )
     parser.add_argument(
         "--chip",
-        required=True,
         type=parse_component,
-        help="Target chip/family string, for example esp32s3",
+        help="Target chip/family, for example esp32s3. Read from the "
+        "configuration when not given",
     )
     parser.add_argument(
         "--compat",
-        required=True,
         type=parse_component,
-        help="Target board/runtime identity, for example esp32s3-xiao",
+        help="Target board identity, for example esp32s3-xiao. Read from "
+        "the configuration when not given",
+    )
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=Path("../nuttx/.config"),
+        help="Generated NuttX .config the target is read from",
+    )
+    parser.add_argument(
+        "--scan",
+        action="append",
+        type=Path,
+        default=[],
+        help=f"Directory to search for {DECLARATION_NAME} files",
+    )
+    parser.add_argument(
+        "--bindir",
+        type=Path,
+        default=Path("bin"),
+        help="Directory holding the built artifacts named by LOCAL_MODULE",
     )
     parser.add_argument(
         "--artifact-prefix",
@@ -235,7 +418,7 @@ def main() -> int:
     parser.add_argument(
         "--package",
         action="append",
-        required=True,
+        default=[],
         type=parse_package_spec,
         help=PACKAGE_SPEC_HELP,
     )
@@ -265,6 +448,34 @@ def main() -> int:
     )
     args = parser.parse_args()
 
+    arch, chip, compat = args.arch, args.chip, args.compat
+    if not (arch and chip and compat):
+        config_path = args.config.expanduser()
+        if not config_path.is_file():
+            parser.error(
+                f"no configuration at {config_path}; pass --config, or give "
+                "--arch/--chip/--compat explicitly"
+            )
+
+        try:
+            derived = derive_target(read_config(config_path))
+        except ValueError as error:
+            parser.error(str(error))
+
+        arch = arch or derived[0]
+        chip = chip or derived[1]
+        compat = compat or derived[2]
+
+    specs = list(args.package)
+    try:
+        bindir = args.bindir.expanduser().resolve()
+        specs.extend(discover_declarations(args.scan, bindir))
+    except ValueError as error:
+        parser.error(str(error))
+
+    if not specs:
+        parser.error("no built packages found; pass --scan or --package")
+
     repo_dir = args.repo_dir.expanduser().resolve()
     repo_dir.mkdir(parents=True, exist_ok=True)
 
@@ -277,8 +488,8 @@ def main() -> int:
     categories = dict(args.package_category)
     icons = dict(args.package_icon)
 
-    for spec in args.package:
-        relpath = artifact_relpath(args.arch, args.chip, args.compat, spec)
+    for spec in specs:
+        relpath = artifact_relpath(arch, chip, compat, spec)
         destination = repo_dir / relpath
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(spec.source, destination)
@@ -290,31 +501,33 @@ def main() -> int:
         package = {
             "name": spec.name,
             "version": spec.version,
-            "arch": args.arch,
-            "compat": args.compat,
+            "arch": arch,
+            "compat": compat,
             "artifact": artifact,
             "sha256": sha256_file(destination),
             "type": spec.payload_type,
         }
 
-        if spec.name in descriptions:
-            package["description"] = descriptions[spec.name]
+        description = descriptions.get(spec.name, spec.description)
+        if description:
+            package["description"] = description
 
-        if spec.name in categories:
-            package["category"] = categories[spec.name]
+        category = categories.get(spec.name, spec.category)
+        if category:
+            package["category"] = category
 
-        if spec.name in icons:
-            icon_bytes = encode_icon_rgb565(icons[spec.name])
-            icon_dest = repo_dir / icon_relpath(
-                args.arch, args.chip, args.compat, spec.name
-            )
+        icon = icons.get(spec.name, spec.icon)
+        if icon:
+            icon_bytes = encode_icon_rgb565(icon)
+            icon_dest = repo_dir / icon_relpath(arch, chip, compat, spec.name)
             icon_dest.parent.mkdir(parents=True, exist_ok=True)
             icon_dest.write_bytes(icon_bytes)
 
-            icon_rel = icon_relpath(
-                args.arch, args.chip, args.compat, spec.name
-            ).as_posix()
+            icon_rel = icon_relpath(arch, chip, compat, spec.name).as_posix()
             package["icon"] = f"{prefix}/{icon_rel}" if prefix else icon_rel
+
+        if spec.requires:
+            package["requires"] = spec.requires
 
         packages_by_id[package_identity(package)] = package
 
